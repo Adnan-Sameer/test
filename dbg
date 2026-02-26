@@ -1,0 +1,177 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)]
+    [string]$InputFile,
+
+    [Parameter(Mandatory)]
+    [string]$OutputDir,
+
+    [switch]$Execute,
+    [switch]$AllowSecurityGroups
+)
+
+# ===== CONFIG =====
+$DC = "STP-DC4-16.stpaul.city"
+Import-Module ActiveDirectory -ErrorAction Stop
+$ErrorActionPreference = "Stop"
+
+# ===== OUTPUT SETUP =====
+if (!(Test-Path $OutputDir)) {
+    New-Item -ItemType Directory -Path $OutputDir | Out-Null
+}
+
+$LogFile = Join-Path $OutputDir ("DeleteLog_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+$SummaryFile = Join-Path $OutputDir "Deletion_Assessment_Summary.csv"
+
+function Write-Log {
+    param([string]$Message)
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $Message"
+    Add-Content -Path $LogFile -Value $line
+    Write-Host $line
+}
+
+# ===== RESOLUTION LOGIC =====
+function Resolve-ADGroup {
+    param([Parameter(Mandatory)][string]$InputValue)
+
+    $v = $InputValue.Trim()
+    Write-Log "Resolving: $v"
+
+    try {
+        # Try DN or GUID first
+        $obj = Get-ADGroup -Identity $v -Properties * -Server $DC -ErrorAction Stop
+        Write-Log "Resolved by Identity"
+        return $obj
+    }
+    catch {}
+
+    if ($v -match '@') {
+        Write-Log "Detected email format → searching mail attribute"
+        $obj = Get-ADGroup -Filter "mail -eq '$v'" -Properties * -Server $DC
+    }
+    elseif ($v -match '^[A-Za-z0-9._-]+$') {
+        Write-Log "Detected likely sAMAccountName"
+        $obj = Get-ADGroup -Filter "SamAccountName -eq '$v'" -Properties * -Server $DC
+    }
+    else {
+        Write-Log "Fallback to Name search"
+        $obj = Get-ADGroup -Filter "Name -eq '$v'" -Properties * -Server $DC
+    }
+
+    if (@($obj).Count -gt 1) {
+        Write-Log "Multiple matches found. Skipping."
+        return $null
+    }
+
+    return $obj
+}
+
+# ===== EXCHANGE TYPE =====
+function Get-ExchangeType {
+    param($GroupName)
+
+    try {
+        if (Get-Command Get-Recipient -ErrorAction SilentlyContinue) {
+            $r = Get-Recipient -Identity $GroupName -ErrorAction Stop
+            return $r.RecipientTypeDetails
+        }
+        else {
+            return "ExchangeCmdletsNotLoaded"
+        }
+    }
+    catch {
+        return "NotExchangeObject"
+    }
+}
+
+# ===== PROCESS =====
+$Groups = Get-Content $InputFile | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+$Results = @()
+
+foreach ($Group in $Groups) {
+
+    Write-Log "--------------------------------------------"
+    Write-Log "Processing: $Group"
+
+    $ADGroup = Resolve-ADGroup $Group
+
+    if (-not $ADGroup) {
+        Write-Log "NOT FOUND OR AMBIGUOUS"
+        $Results += [pscustomobject]@{
+            Group = $Group
+            FoundInAD = "No"
+            DeletionReadiness = "NotFoundOrAmbiguous"
+            Action = "Skipped"
+        }
+        continue
+    }
+
+    # Counts
+    $MemberCount = (Get-ADGroupMember $ADGroup -Recursive -Server $DC | Measure-Object).Count
+    $ParentMembershipCount = (Get-ADPrincipalGroupMembership $ADGroup -Server $DC | Measure-Object).Count
+    $ExchangeType = Get-ExchangeType $ADGroup.SamAccountName
+
+    # Readiness logic
+    $Readiness = "SafeToDelete"
+
+    if ($ADGroup.GroupCategory -eq "Security") {
+        $Readiness = "SecurityGroup-ReviewRequired"
+    }
+
+    if ($ParentMembershipCount -gt 0) {
+        $Readiness = "NestedInOtherGroups-ReviewRequired"
+    }
+
+    if ($ExchangeType -like "*Security*") {
+        $Readiness = "MailEnabledSecurity-ReviewRequired"
+    }
+
+    # Backup always
+    Write-Log "Backing up group metadata and members"
+
+    $ADGroup |
+        Select Name,SamAccountName,GroupCategory,GroupScope,mail,ManagedBy,ObjectGUID,SID |
+        Export-Csv (Join-Path $OutputDir "$($ADGroup.SamAccountName)_Backup.csv") -NoTypeInformation
+
+    Get-ADGroupMember $ADGroup -Recursive -Server $DC |
+        Select Name,SamAccountName,ObjectClass |
+        Export-Csv (Join-Path $OutputDir "$($ADGroup.SamAccountName)_Members.csv") -NoTypeInformation
+
+    # Deletion logic
+    if (-not $Execute) {
+        Write-Log "Dry run mode → WouldDelete"
+        $Action = "WouldDelete"
+    }
+    else {
+        if ($Readiness -eq "SafeToDelete" -or $AllowSecurityGroups) {
+            try {
+                Write-Log "Deleting group"
+                Remove-ADGroup -Identity $ADGroup.DistinguishedName -Confirm:$false -Server $DC
+                $Action = "Deleted"
+            }
+            catch {
+                Write-Log "Deletion failed: $_"
+                $Action = "DeleteError"
+            }
+        }
+        else {
+            Write-Log "Skipped due to risk classification"
+            $Action = "SkippedDueToRisk"
+        }
+    }
+
+    $Results += [pscustomobject]@{
+        Group = $Group
+        FoundInAD = "Yes"
+        GroupCategory = $ADGroup.GroupCategory
+        ExchangeType = $ExchangeType
+        MemberCount = $MemberCount
+        ParentGroupCount = $ParentMembershipCount
+        DeletionReadiness = $Readiness
+        Action = $Action
+    }
+}
+
+# Export summary
+$Results | Export-Csv $SummaryFile -NoTypeInformation
+Write-Log "Completed. Summary saved at $SummaryFile"
